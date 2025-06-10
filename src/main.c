@@ -6,6 +6,10 @@
 #include <zephyr/net/net_ip.h>
 #include <zephyr/net/mqtt.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/uart.h>
+#include <math.h>
 #include <string.h>
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
@@ -15,6 +19,12 @@ LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 #define MQTT_SUB_TOPIC "zephyr/test"
 #define MQTT_PUB_TOPIC "zephyr/test"
 #define MQTT_PAYLOAD "Hello from ESP32-Zephyr!"
+
+//-------------------------co2--------------------//
+#define UART_DEVICE DT_NODELABEL(uart1) // Use uart0 or update to uart1 if needed
+#define MHZ19_READ_INTERVAL K_SECONDS(2)
+const struct device *uart_dev;
+k_timeout_t getDataTimer = MHZ19_READ_INTERVAL;
 
 // MQTT credentials
 static const char mqtt_user[] = "admin";
@@ -39,7 +49,7 @@ static struct net_if *wifi_iface = NULL;
 #define MQTT_BROKER_PORT 1883
 #define MQTT_SUB_TOPIC "zephyr/test"
 #define MQTT_PUB_TOPIC "zephyr/test"
-#define MQTT_PAYLOAD "Hello from ESP32-Zephyr!"
+
 void assign_static_ip(void)
 {
     struct net_if *iface = net_if_get_default();
@@ -78,23 +88,6 @@ static void mqtt_event_handler(struct mqtt_client *const c, const struct mqtt_ev
         mqtt_subscribe(c, &sub_list);
         LOG_INF("📡 Subscribed to topic: %s", MQTT_SUB_TOPIC);
 
-        struct mqtt_publish_param pub_param = {
-            .message.topic = {
-                .topic = {
-                    .utf8 = MQTT_PUB_TOPIC,
-                    .size = strlen(MQTT_PUB_TOPIC)
-                },
-                .qos = MQTT_QOS_1_AT_LEAST_ONCE
-            },
-            .message.payload.data = MQTT_PAYLOAD,
-            .message.payload.len = strlen(MQTT_PAYLOAD),
-            .message_id = 2,
-            .dup_flag = 0,
-            .retain_flag = 0
-        };
-
-        mqtt_publish(c, &pub_param);
-        LOG_INF("📨 Published message to topic: %s", MQTT_PUB_TOPIC);
         break;
 
     case MQTT_EVT_PUBLISH: {
@@ -173,6 +166,37 @@ static void print_ip_address(void)
         LOG_ERR("❌ No IPv4 address configuration found");
     }
 }
+//------------------------ co2 read sensor-----------------//
+static int mhz19_get_co2_raw(void)
+{
+    uint8_t command[9] = {0xFF, 0x01, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x79};
+    uint8_t response[9];
+
+    // Transmit command byte by byte
+    for (int i = 0; i < sizeof(command); i++) {
+        uart_poll_out(uart_dev, command[i]);
+    }
+
+    // Wait a bit for sensor to respond
+    k_sleep(K_MSEC(10));
+
+    // Read 9 bytes of response
+    for (int i = 0; i < 9; i++) {
+        int ret = uart_poll_in(uart_dev, &response[i]);
+        if (ret < 0) {
+            printk("UART RX poll failed at byte %d\n", i);
+            return -1;
+        }
+    }
+
+    // Validate and extract CO2 value
+    if (response[0] == 0xFF && response[1] == 0x86) {
+        int raw_co2 = (response[2] << 8) | response[3];
+        return raw_co2;
+    }
+
+    return -1;
+}
 
 void main(void)
 {
@@ -198,7 +222,7 @@ void main(void)
     memset(&broker, 0, sizeof(broker));
     broker.sin_family = AF_INET;
     broker.sin_port = htons(1883);
-    net_addr_pton(AF_INET, "192.168.0.107", &broker.sin_addr);
+    net_addr_pton(AF_INET, "192.168.0.102", &broker.sin_addr);
 
     mqtt_client_init(&client);
     client.broker = &broker;
@@ -230,10 +254,52 @@ void main(void)
     }
 
     LOG_INF("📡 MQTT loop starting");
-
-    while (1) {
-        mqtt_input(&client);
-        mqtt_live(&client);
-        k_sleep(K_MSEC(500));
+    uart_dev = DEVICE_DT_GET(UART_DEVICE);
+    if (!device_is_ready(uart_dev)) {
+        printk("UART device not found!\n");
+        return;
     }
+
+    printk("MH-Z19 CO2 sensor initialized on ESP32 (Zephyr)\n");
+
+
+   while (1) {
+    int raw_co2 = mhz19_get_co2_raw();
+    if (raw_co2 != -1) {
+        printk("Raw CO2: %d ppm\n", raw_co2);
+        char payload_str[16];
+        snprintf(payload_str, sizeof(payload_str), "%d", raw_co2);
+
+        struct mqtt_publish_param pub_param = {
+            .message.topic = {
+                .topic = {
+                    .utf8 = MQTT_PUB_TOPIC,
+                    .size = strlen(MQTT_PUB_TOPIC)
+                },
+                .qos = MQTT_QOS_1_AT_LEAST_ONCE
+            },
+            .message.payload.data = payload_str,
+            .message.payload.len = strlen(payload_str),
+            .message_id = k_uptime_get_32(),
+            .dup_flag = 0,
+            .retain_flag = 0
+        };
+
+        int ret = mqtt_publish(&client, &pub_param);
+        if (ret != 0) {
+            LOG_ERR("MQTT publish failed: %d", ret);
+        } else {
+            LOG_INF("📤 CO2 value published: %s ppm", payload_str);
+        }
+    } else {
+        printk("Failed to read CO2\n");
+    }
+
+    // 👉 Keeps MQTT socket alive
+    mqtt_input(&client);
+    mqtt_live(&client);
+
+    // Small sleep to yield CPU and let UART breathe
+    k_sleep(K_SECONDS(2));
+}
 }

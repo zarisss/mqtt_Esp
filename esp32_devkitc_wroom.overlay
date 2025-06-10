@@ -4,3 +4,17 @@
 		status = "okay";
 	};
 };
+&uart1 {
+    status = "okay";
+    pinctrl-0 = <&uart1_pins>;
+    pinctrl-names = "default";
+    current-speed = <9600>; 
+};
+
+&pinctrl {
+    uart1_pins: uart1_pins {
+        group1 {
+            pinmux = <UART1_TX_GPIO17>, <UART1_RX_GPIO16>;
+        }; 
+    };
+};

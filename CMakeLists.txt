@@ -4,7 +4,7 @@ find_package(Zephyr
             REQUIRED HINTS
             $ENV{ZEPHYR_BASE})
 
-project(esp_lwm2m)
+project(mqtt_Esp)
 
 target_sources(app
                 PRIVATE
